@@ -11,9 +11,12 @@ Cortensor Node Watcher (single-file)
     * traceback_unrecovered (traceback persists beyond a window)
     * pingfail
     * node_pool_stale
-    * wrong_user_state  (node in USER mode but appears in "Assigned Miners" list; restart flag default OFF per config)
-- Displays latest Cognitive Level ("Cognitive Level:" or "CL:") per node as CL:<value>
-  (handles leading whitespace, tabs, and any position within the line)
+    * wrong_user_state  (node in USER mode but appears in "Assigned Miners" list; flag default OFF)
+- Displays latest Cognitive Level (Cognitive Level: <n>) per node as CL:<value>
+  * tolerant of leading tabs/whitespace, anywhere-in-line matches, trailing punctuation
+  * updates to CL are **gated**: only when node is **Selected** and **State == 3**
+  * startup backfill scan (last ~2MB of each log) to seed CL if it’s older than the initial tail
+  * persists to config.json as last_cognitive_level
 - Prints "last complete session" (max session id where State=6) in the header
 - Shows per-node "session_id/State=n"; when State is 3 or 4, appends "Selected" or "Not Selected"
   based on most recent "Assigned Miners" snapshot
@@ -22,6 +25,7 @@ Cortensor Node Watcher (single-file)
   * Supports sudo via config: use_sudo + sudo_non_interactive + sudo_path + systemctl_path
 - Version check: compares local version v1.0.1 against GitHub latest
   (repo: scerb/node_switch_watch) on startup and once every 24h.
+- **New:** Each node line shows the **last restart reason** alongside the last restart age.
 
 Python 3.10+ (standard library only).
 """
@@ -48,15 +52,11 @@ from collections import deque
 # Versioning (local + remote check)
 # -------------------------
 
-LOCAL_VERSION = "v1.0.1"
+LOCAL_VERSION = "v1.0.2"
 VERSION_REPO = "scerb/node_switch_watch"
 VERSION_API_URL = f"https://api.github.com/repos/{VERSION_REPO}/releases/latest"
 
 def fetch_latest_release_tag(url: str, timeout: float = 5.0) -> Optional[str]:
-    """
-    Returns the latest release tag_name from GitHub API or None on error/rate-limit.
-    Uses stdlib urllib to avoid external dependencies.
-    """
     try:
         req = urllib.request.Request(
             url,
@@ -78,10 +78,9 @@ def fetch_latest_release_tag(url: str, timeout: float = 5.0) -> Optional[str]:
 # Constants & Regex Patterns
 # -------------------------
 
-ENV_DIR = Path("/home/deploy/.cortensor")  # per your setup
+ENV_DIR = Path("/home/deploy/.cortensor")
 ENV_GLOB = ".env-*"
 
-# Prefer daemon-style name first; fall back to non-daemon if missing.
 LOG_PRIMARY_FMT = "/var/log/cortensord-{idx}.log"
 LOG_FALLBACK_FMT = "/var/log/cortensor-{idx}.log"
 
@@ -95,91 +94,82 @@ NODE_POOL_STALE_KEYS = (
     "Node Pool Reserved Node Stale:",
 )
 
-# Wrong user state & CL
+# Assigned miners / user mode
 ASSIGNED_MINERS_RE = re.compile(r".*Assigned Miners:\s*(.+)")
 USER_TOKEN = "USER"
 
-# Cognitive Level (display)
-# Robust: finds "Cognitive Level: <num>" or "CL: <num>" anywhere in the line (tabs/whitespace allowed)
+# Cognitive Level detection (Cognitive Level only; not generic "CL:")
 COGNITIVE_LEVEL_ANCHORED_RE = re.compile(
-    r"^\s*(?:\*\s*)?(?:Cognitive\s+Level|CL)\s*:\s*([^\r\n]+)$",
+    r"^\s*(?:\*\s*)?Cognitive\s+Level\s*:\s*([^\r\n]+)\s*$",
     re.IGNORECASE
 )
 COGNITIVE_LEVEL_ANY_RE = re.compile(
-    r"(?:Cognitive\s+Level|CL)\s*:\s*([0-9]+)",
+    r"Cognitive\s+Level\s*:\s*([0-9]+)(?:\s*[^\d\r\n]*)?",
     re.IGNORECASE
 )
 
 # Session/State parsing:
-# - New format (combined): "* Latest ID:  1101  / Latest State:  3"
 LATEST_BOTH_RE = re.compile(
     r"^\s*(?:\*\s*)?Latest\s+ID\s*:\s*(\d+)\s*(?:/|\|)\s*Latest\s+State\s*:\s*(\d+)\s*$",
     re.IGNORECASE
 )
-# - New format (split): "* Latest ID: 1101" or "* Latest State: 3"
 LATEST_ID_RE = re.compile(r"^\s*(?:\*\s*)?Latest\s+ID\s*:\s*(\d+)\s*$", re.IGNORECASE)
 LATEST_STATE_RE = re.compile(r"^\s*(?:\*\s*)?Latest\s+State\s*:\s*(\d+)\s*$", re.IGNORECASE)
-
-# - Legacy/other formats (still supported)
 SESSION_STATE_COMBINED_RE = re.compile(
     r"^\s*(?:\*\s*)?(?:Remote\s*Session|Session\s*ID)\s*[:=\s]*\s*(\d+).*?\bState\s*[:=\s]*\s*(\d+)",
     re.IGNORECASE
 )
-SESSION_ID_RE = re.compile(r"(?i)(?:Remote\s*Session|Session\s*ID)\s*[:=\s]*\s*(\d+)")
-STATE_RE = re.compile(r"(?i)\bState\s*[:=\s]*\s*(\d+)")
+SESSION_ID_SOLO_RE = re.compile(r"^\s*(?:\*\s*)?(?:Remote\s*Session|Session\s*ID)\s*[:=\s]*\s*(\d+)\s*$", re.IGNORECASE)
+STATE_SOLO_RE = re.compile(r"^\s*(?:\*\s*)?\bState\s*[:=\s]*\s*(\d+)\s*$", re.IGNORECASE)
 
 # Address extraction & normalization
-ADDR_RE = re.compile(r"0[xX][0-9a-fA-F]+")  # accept any length hex token beginning with 0x/0X
+ADDR_RE = re.compile(r"0[xX][0-9a-fA-F]+")  # any hex token that starts with 0x/0X
 
 def extract_addresses(text: str) -> Set[str]:
-    """Extract all 0x-like addresses from a string, canonicalized to lowercase."""
     return {m.lower() for m in ADDR_RE.findall(text or "")}
 
 def canonicalize_address(text: str) -> Optional[str]:
-    """
-    Return the first 0x-like address in `text`, canonicalized to lowercase, or None.
-    If `text` itself looks like an address, it is returned canonicalized.
-    """
     if not text:
         return None
-    # if it already looks like an address
     s = text.strip().strip('",[]{}()<>')
     if s.lower().startswith("0x"):
         return s.lower()
-    # else try to find one within the text
     found = extract_addresses(text)
     if found:
-        # pick the first by occurrence order
         m = ADDR_RE.search(text)
         return m.group(0).lower() if m else next(iter(found))
     return None
 
 def short_addr(addr: Optional[str], head: int = 6, tail: int = 6) -> str:
-    """Return addr truncated to first `head` and last `tail` chars with an ellipsis."""
     if not addr:
         return "-"
     if len(addr) <= head + tail:
         return addr
     return f"{addr[:head]}…{addr[-tail:]}"
 
+def fmt_age(now: datetime, then: Optional[datetime]) -> str:
+    if not then:
+        return "-"
+    return f"{int((now - then).total_seconds())}s"
+
 # -------------------------
 # Config Management
 # -------------------------
 
 DEFAULT_CONFIG = {
-    "check_interval_seconds": 5,               # polling interval
-    "tail_lines": 400,                         # in-memory buffer per node
-    "traceback_recovery_seconds": 240,         # window before 'traceback_unrecovered'
-    "pingfail_threshold": 2,                   # count within window
-    "pingfail_window": 52,                     # sliding window size
-    "cooldown_minutes": 2,                     # min time between restarts per node
-    "restart_dry_run": False,                  # if True, do not actually restart
-    # ---- systemctl / sudo integration ----
-    "use_sudo": True,                          # set True if running as non-root without polkit
+    "check_interval_seconds": 5,
+    "tail_lines": 400,
+    "traceback_recovery_seconds": 240,
+    "pingfail_threshold": 2,
+    "pingfail_window": 52,
+    "cooldown_minutes": 2,
+    "restart_dry_run": False,
+    # systemctl / sudo
+    "use_sudo": True,
     "sudo_path": "/usr/bin/sudo",
-    "sudo_non_interactive": True,              # adds '-n' (no password prompt)
+    "sudo_non_interactive": True,
     "systemctl_path": "/bin/systemctl",
-    # --------------------------------------
+    # restart flags
     "restart_flags": {
         "traceback": False,
         "traceback_unrecovered": True,
@@ -187,7 +177,7 @@ DEFAULT_CONFIG = {
         "node_pool_stale": True,
         "wrong_user_state": False,
     },
-    # nodes are auto-discovered and persisted; we also persist last_selected_task per node
+    # nodes array is persisted with extras like last_selected_task, last_cognitive_level
     "nodes": []
 }
 
@@ -229,7 +219,7 @@ def deep_merge(base: dict, override: dict) -> dict:
 @dataclass
 class NodeConfig:
     index: int
-    address: str     # canonicalized (lowercase 0x...)
+    address: str     # canonicalized
     env_path: str
     log_path: str
     service: str
@@ -256,12 +246,11 @@ def discover_nodes_from_envs() -> List[NodeConfig]:
         log_primary = Path(LOG_PRIMARY_FMT.format(idx=idx))
         log_fallback = Path(LOG_FALLBACK_FMT.format(idx=idx))
         log_path = str(log_primary if log_primary.exists() else log_fallback)
-
         service = SYSTEMD_SERVICE_FMT.format(idx=idx)
 
         nodes.append(NodeConfig(
             index=idx,
-            address=address,     # canonicalized already
+            address=address,
             env_path=str(env_path),
             log_path=log_path,
             service=service
@@ -278,7 +267,6 @@ def parse_env_for_address(env_path: Path) -> Optional[str]:
                 if line.startswith("NODE_PUBLIC_KEY"):
                     parts = line.split("=", 1)
                     if len(parts) == 2:
-                        # drop inline comments if present
                         val = parts[1].split("#", 1)[0].strip().strip('"').strip("'")
                         canon = canonicalize_address(val)
                         return canon or val.strip().lower()
@@ -288,13 +276,12 @@ def parse_env_for_address(env_path: Path) -> Optional[str]:
 
 def merge_discovered_nodes_into_config(cfg: dict, discovered: List[NodeConfig]) -> dict:
     """
-    Preserve any existing custom fields (e.g., last_selected_task) while updating
+    Preserve any existing custom fields (e.g., last_selected_task, last_cognitive_level) while updating
     discovered fields (address/env_path/log_path/service).
     """
     existing_by_index: Dict[int, dict] = {n.get("index"): dict(n) for n in cfg.get("nodes", []) if "index" in n}
     for nd in discovered:
         existing = existing_by_index.get(nd.index, {})
-        # overwrite only the known discovery fields
         existing.update({
             "index": nd.index,
             "address": nd.address,
@@ -312,10 +299,7 @@ def merge_discovered_nodes_into_config(cfg: dict, discovered: List[NodeConfig]) 
 
 class FileTailer:
     """
-    Minimal tail -F like follower:
-      - Reads appended data as the file grows
-      - Reopens when inode changes or file is truncated (rotation)
-      - On open, captures last `init_tail_lines` lines to buffer (returned once via `prime_tail()`)
+    Minimal tail -F like follower with rotation handling and initial tail capture.
     """
     def __init__(self, path: str, init_tail_lines: int = 200, encoding: str = "utf-8"):
         self.path = path
@@ -434,6 +418,8 @@ class RestartManager:
             self.master_log.write_text("", encoding="utf-8")
         self.cooldown = timedelta(minutes=cooldown_minutes)
         self.last_restart: Dict[str, datetime] = {}
+        self.last_reason: Dict[str, str] = {}           # <--- store reason per service
+        self.last_evidence_file: Dict[str, str] = {}    # optional: evidence file name
         self.dry_run = dry_run
 
         self.use_sudo = use_sudo
@@ -462,6 +448,7 @@ class RestartManager:
         except Exception as e:
             print(f"[WARN] Failed to write master log: {e}", file=sys.stderr)
 
+        # Build command (sudo/systemctl)
         if self.dry_run:
             print(f"[{node_service}] ✔ (dry-run) Would restart ({reason_key})")
         else:
@@ -471,14 +458,16 @@ class RestartManager:
                 if self.sudo_non_interactive:
                     cmd.append("-n")
             cmd.extend([self.systemctl_path, "restart", node_service])
-
             try:
                 subprocess.run(cmd, check=True)
                 print(f"[{node_service}] ✔ Restarted ({reason_key})")
             except subprocess.CalledProcessError as e:
                 print(f"[{node_service}] ✘ Restart failed: {e}", file=sys.stderr)
 
+        # Record last restart time + reason (even in dry-run to make it visible)
         self.last_restart[node_service] = now
+        self.last_reason[node_service] = reason_key
+        self.last_evidence_file[node_service] = fname
         return True
 
 # -------------------------
@@ -492,21 +481,18 @@ class NodeConfigState:
     env_path: str
     log_path: str
     service: str
-    last_selected_task: Optional[int] = None  # persisted
+    last_selected_task: Optional[int] = None   # persisted
+    last_cognitive_level: Optional[str] = None # persisted
 
 @dataclass
 class NodeState:
     cfg: NodeConfigState
     tailer: FileTailer
     buf: deque[str] = field(default_factory=lambda: deque(maxlen=200))
-    # traceback tracking
     traceback_first_detected: Optional[datetime] = None
     traceback_last_seen: Optional[datetime] = None
-    # wrong_user_state debouncer
     last_assignment_snapshot_at: Optional[datetime] = None
-    # cognitive level display
     last_cl: Optional[str] = None
-    # session/state display
     last_session_id: Optional[int] = None
     last_state: Optional[int] = None
 
@@ -534,51 +520,74 @@ def saw_node_pool_stale(lines: List[str]) -> bool:
                 return True
     return False
 
-def maybe_update_cognitive_level(st: NodeState, line: str) -> None:
-    # Try anchored form first (line-only)
+# -------------------------
+# Cognitive Level helpers
+# -------------------------
+
+def normalize_cl_value(raw: str) -> Optional[str]:
+    if raw is None:
+        return None
+    raw = raw.strip()
+    mnum = re.search(r"(\d+)", raw)
+    if mnum:
+        return mnum.group(1)
+    raw = re.sub(r"[.\s]+$", "", raw)
+    return raw or None
+
+def detect_cognitive_level_value(line: str) -> Optional[str]:
+    # Only accept "Cognitive Level:" phrases (not generic "CL:")
     m = COGNITIVE_LEVEL_ANCHORED_RE.search(line)
     if not m:
-        # Fallback: search anywhere within the line (e.g., timestamp prefix present)
         m = COGNITIVE_LEVEL_ANY_RE.search(line)
-    if m:
-        val = m.group(1).strip()
-        # Normalize to just digits if present
-        mnum = re.search(r"(\d+)", val)
-        if mnum:
-            st.last_cl = mnum.group(1)
-        else:
-            # fallback to raw (trim trailing punctuation/space)
-            val = re.sub(r"[.\s]+$", "", val)
-            if val:
-                st.last_cl = val
+    if not m:
+        return None
+    return normalize_cl_value(m.group(1))
 
-# ---- Session/State parsing helpers ----
+def backfill_cognitive_level_from_file(path: str, max_bytes: int = 2_000_000, encoding: str = "utf-8") -> Optional[str]:
+    """
+    Scan the last max_bytes of the file for the most recent 'Cognitive Level' occurrence.
+    Returns the normalized value or None.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        offset = max(0, size - max_bytes)
+        with open(path, "r", encoding=encoding, errors="replace") as f:
+            if offset:
+                f.seek(offset)
+                _ = f.readline()
+            last_val = None
+            for line in f:
+                nv = detect_cognitive_level_value(line)
+                if nv is not None:
+                    last_val = nv
+            return last_val
+    except Exception:
+        return None
+
+# -------------------------
+# Session/State parsing helpers
+# -------------------------
 
 def parse_session_state_from_line(line: str) -> Optional[Tuple[int, int]]:
-    """Try to parse BOTH (session_id, state) from one line."""
     m = LATEST_BOTH_RE.search(line)
     if m:
         try:
-            sid = int(m.group(1)); state = int(m.group(2))
-            return sid, state
+            return int(m.group(1)), int(m.group(2))
         except Exception:
             return None
-
     m = SESSION_STATE_COMBINED_RE.search(line)
     if m:
         try:
-            sid = int(m.group(1)); state = int(m.group(2))
-            return sid, state
+            return int(m.group(1)), int(m.group(2))
         except Exception:
             return None
-
-    # Fallback: separate legacy hints in same line
-    m_sid = SESSION_ID_RE.search(line)
-    m_st = STATE_RE.search(line)
+    m_sid = SESSION_ID_SOLO_RE.search(line)
+    m_st = STATE_SOLO_RE.search(line)
     if m_sid and m_st:
         try:
-            sid = int(m_sid.group(1)); state = int(m_st.group(1))
-            return sid, state
+            return int(m_sid.group(1)), int(m_st.group(1))
         except Exception:
             return None
     return None
@@ -590,7 +599,7 @@ def parse_latest_id_only(line: str) -> Optional[int]:
             return int(m.group(1))
         except Exception:
             return None
-    m2 = re.search(r"^\s*(?:\*\s*)?(?:Remote\s*Session|Session\s*ID)\s*[:=\s]*\s*(\d+)\s*$", line, re.IGNORECASE)
+    m2 = SESSION_ID_SOLO_RE.search(line)
     if m2:
         try:
             return int(m2.group(1))
@@ -605,7 +614,7 @@ def parse_latest_state_only(line: str) -> Optional[int]:
             return int(m.group(1))
         except Exception:
             return None
-    m2 = re.search(r"^\s*(?:\*\s*)?\bState\s*[:=\s]*\s*(\d+)\s*$", line, re.IGNORECASE)
+    m2 = STATE_SOLO_RE.search(line)
     if m2:
         try:
             return int(m2.group(1))
@@ -621,14 +630,13 @@ def parse_latest_state_only(line: str) -> Optional[int]:
 class AssignedMinersSnapshot:
     at: datetime
     source_service: str
-    miners: set[str]  # canonicalized addresses (lowercase)
+    miners: set[str]  # canonicalized
     context: List[str]
 
 def scan_assigned_miners_from_lines(lines: List[str]) -> Optional[Tuple[set[str], int]]:
     for idx, ln in enumerate(lines):
         m = ASSIGNED_MINERS_RE.search(ln)
         if m:
-            # Extract addresses robustly from the remainder of the line
             miners = extract_addresses(m.group(1))
             return miners, idx
     return None
@@ -677,6 +685,13 @@ def _consume_recent_pattern(buf: deque[str], startswith: str, window: int = 52):
     for ln in new_list[-buf.maxlen:]:
         buf.append(ln)
 
+def _update_cfg_node_field(cfg: dict, node_index: int, field: str, value):
+    for n in cfg["nodes"]:
+        if n.get("index") == node_index:
+            n[field] = value
+            return True
+    return False
+
 # -------------------------
 # Main Orchestration
 # -------------------------
@@ -719,7 +734,7 @@ def main():
     sudo_non_interactive = bool(cfg.get("sudo_non_interactive", True))
     systemctl_path = str(cfg.get("systemctl_path", "/bin/systemctl"))
 
-    # Build node states (preserve last_selected_task if present)
+    # Build node states (preserving persisted fields)
     nodes_cfg: List[NodeConfigState] = []
     for n in cfg["nodes"]:
         nodes_cfg.append(
@@ -729,7 +744,8 @@ def main():
                 env_path=n["env_path"],
                 log_path=n["log_path"],
                 service=n["service"],
-                last_selected_task=n.get("last_selected_task")
+                last_selected_task=n.get("last_selected_task"),
+                last_cognitive_level=n.get("last_cognitive_level"),
             )
         )
 
@@ -737,10 +753,23 @@ def main():
     for nd in nodes_cfg:
         tailer = FileTailer(nd.log_path, init_tail_lines=tail_lines)
         st = NodeState(cfg=nd, tailer=tailer, buf=deque(maxlen=tail_lines))
+
+        # Seed with persisted CL so it shows immediately on restart
+        if nd.last_cognitive_level:
+            st.last_cl = nd.last_cognitive_level
+
+        # Prime tail and parse historical lines
         primed = tailer.prime_tail()
+        primed_cl_candidate: Optional[str] = None
+
         for ln in primed:
             st.buf.append(ln)
-            maybe_update_cognitive_level(st, ln)
+
+            # Collect candidate CL (we'll accept at startup to seed)
+            nv = detect_cognitive_level_value(ln)
+            if nv is not None:
+                primed_cl_candidate = nv
+
             # initialize session/state from primed lines
             res = parse_session_state_from_line(ln)
             if res:
@@ -754,7 +783,25 @@ def main():
                 st_only = parse_latest_state_only(ln)
                 if st_only is not None:
                     st.last_state = st_only
+
+        # On startup, accept the last CL candidate found in primed lines (no gating)
+        if primed_cl_candidate is not None:
+            st.last_cl = primed_cl_candidate
+            st.cfg.last_cognitive_level = primed_cl_candidate
+            _update_cfg_node_field(cfg, st.cfg.index, "last_cognitive_level", primed_cl_candidate)
+
         states[nd.index] = st
+
+        # Backfill CL from older part of the file, if still missing
+        if st.last_cl is None:
+            bf = backfill_cognitive_level_from_file(nd.log_path)
+            if bf:
+                st.last_cl = bf
+                st.cfg.last_cognitive_level = bf
+                _update_cfg_node_field(cfg, st.cfg.index, "last_cognitive_level", bf)
+
+    # Persist any seeded CL updates
+    save_config(CONFIG_PATH, cfg)
 
     restarter = RestartManager(
         cooldown_minutes=cooldown_minutes,
@@ -786,11 +833,11 @@ def main():
             pass
 
     # Main loop
-    config_dirty = False  # write config.json only when needed
+    config_dirty = False
     while running:
         now = datetime.now(timezone.utc)
 
-        # --- Daily version re-check ---
+        # Daily version re-check
         if (now - last_version_check).total_seconds() >= 86400:
             rt = fetch_latest_release_tag(VERSION_API_URL)
             if rt is None:
@@ -801,16 +848,22 @@ def main():
                 version_status = f"please update ({rt})"
             last_version_check = now
 
-        # Read new lines and update buffers
+        # Pass 1: Read new lines for each node and extract data
         new_lines_by_idx: Dict[int, List[str]] = {}
+        cl_candidates: Dict[int, str] = {}  # collect potential CL updates this tick
+
         for idx, st in states.items():
             new_lines = st.tailer.read_new_lines()
             if new_lines:
                 for ln in new_lines:
                     st.buf.append(ln)
-                    maybe_update_cognitive_level(st, ln)
 
-                    # Combined parse first
+                    # Collect CL candidate (apply later with gating)
+                    nv = detect_cognitive_level_value(ln)
+                    if nv is not None:
+                        cl_candidates[idx] = nv  # keep latest in this batch
+
+                    # Session/State updates (apply immediately)
                     res = parse_session_state_from_line(ln)
                     if res:
                         sid, state = res
@@ -820,7 +873,6 @@ def main():
                             last_complete_session = sid if last_complete_session is None else max(last_complete_session, sid)
                         continue
 
-                    # If not combined, try split (ID only / State only)
                     sid_only = parse_latest_id_only(ln)
                     if sid_only is not None:
                         st.last_session_id = sid_only
@@ -833,7 +885,7 @@ def main():
 
             new_lines_by_idx[idx] = new_lines
 
-        # Wrong User State snapshot
+        # Pass 2: Look for new "Assigned Miners" snapshot in any node's lines
         src_idx_found = None
         miners_found: Optional[set[str]] = None
         line_idx = None
@@ -852,13 +904,13 @@ def main():
             assigned_snapshot = AssignedMinersSnapshot(
                 at=now,
                 source_service=src_state.cfg.service,
-                miners=miners_found,  # canonicalized
+                miners=miners_found,
                 context=ctx
             )
             print(f"[ASSIGN] Snapshot from {src_state.cfg.service} at {assigned_snapshot.at.isoformat()} "
                   f"miners={sorted(list(assigned_snapshot.miners))}")
 
-        # Apply wrong_user_state rule (flag default False per your config)
+        # Pass 3: Apply "wrong_user_state" rule (optional by flag)
         if assigned_snapshot and flags.get("wrong_user_state", False):
             for idx, st in states.items():
                 if st.is_user_mode_recent():
@@ -873,7 +925,7 @@ def main():
                         _restart_if_enabled(restarter, st, "wrong_user_state", flags, ev)
                         st.last_assignment_snapshot_at = snapshot_ts
 
-        # Error scans
+        # Pass 4: Error scans
         for idx, st in states.items():
             lines = new_lines_by_idx[idx]
 
@@ -914,21 +966,28 @@ def main():
                 evidence = list(st.buf)[-50:]
                 _restart_if_enabled(restarter, st, "node_pool_stale", flags, evidence)
 
-        # Update "last_selected_task" persistence when selected in State 3/4
+        # Pass 5: Apply CL candidates with gating (Selected & State == 3 only)
+        if cl_candidates:
+            for idx, cand in cl_candidates.items():
+                st = states[idx]
+                selected_now = bool(assigned_snapshot and (st.cfg.address in assigned_snapshot.miners))
+                if selected_now and st.last_state == 3:
+                    if st.last_cl != cand:
+                        st.last_cl = cand
+                        st.cfg.last_cognitive_level = cand
+                        _update_cfg_node_field(cfg, st.cfg.index, "last_cognitive_level", cand)
+                        config_dirty = True
+                # else: ignore the candidate to keep the previous CL persistent
+
+        # Update "last_selected_task" when selected in State 3/4
         if assigned_snapshot:
             for idx, st in states.items():
                 if st.last_session_id is not None and st.last_state in (3, 4):
                     selected = st.cfg.address in assigned_snapshot.miners
-                    if selected:
-                        # Only update if changed
-                        if st.cfg.last_selected_task != st.last_session_id:
-                            st.cfg.last_selected_task = st.last_session_id
-                            # reflect into cfg["nodes"] and mark dirty
-                            for n in cfg["nodes"]:
-                                if n.get("index") == st.cfg.index:
-                                    n["last_selected_task"] = st.cfg.last_selected_task
-                                    break
-                            config_dirty = True
+                    if selected and st.cfg.last_selected_task != st.last_session_id:
+                        st.cfg.last_selected_task = st.last_session_id
+                        _update_cfg_node_field(cfg, st.cfg.index, "last_selected_task", st.cfg.last_selected_task)
+                        config_dirty = True
 
         # Persist config if modified
         if config_dirty:
@@ -947,29 +1006,30 @@ def main():
         if assigned_snapshot:
             ago = int((now - assigned_snapshot.at).total_seconds())
             print(f"[ASSIGN] last from {assigned_snapshot.source_service} {ago}s ago; miners={len(assigned_snapshot.miners)}")
+
         for idx in sorted(states):
             st = states[idx]
-            # Build session/state display like "11090/State=3 Selected" or "... Not Selected"
+            # session/state display
             if st.last_session_id is not None and st.last_state is not None:
                 sess_disp = f"{st.last_session_id}/State={st.last_state}"
-                selected = False
                 if st.last_state in (3, 4):
                     selected = bool(assigned_snapshot and (st.cfg.address in assigned_snapshot.miners))
                     sess_disp += f" {'Selected' if selected else 'Not Selected'}"
             elif st.is_user_mode_recent():
                 sess_disp = "USER/Mode=USER"
-                selected = False
             else:
                 sess_disp = "-/State=-"
-                selected = False
 
-            last_restart = restarter.last_restart.get(st.cfg.service)
-            lr = f"{int((now - last_restart).total_seconds())}s ago" if last_restart else "-"
+            # restart age + reason
+            last_restart_time = restarter.last_restart.get(st.cfg.service)
+            last_restart_age = fmt_age(now, last_restart_time)
+            last_reason = restarter.last_reason.get(st.cfg.service, "-")
+
             cl = st.last_cl if st.last_cl is not None else "-"
             lts = st.cfg.last_selected_task if st.cfg.last_selected_task is not None else "-"
             addr_disp = short_addr(st.cfg.address)
 
-            print(f"[{st.cfg.service}] addr={addr_disp} | {sess_disp} | CL:{cl} | last_task={lts} | last_restart={lr}")
+            print(f"[{st.cfg.service}] addr={addr_disp} | {sess_disp} | CL:{cl} | last_task={lts} | last_restart={last_restart_age} reason={last_reason}")
 
         time.sleep(interval)
 
